@@ -1,0 +1,93 @@
+"""Batched matrix utilities. Every tensor carries a leading seed dimension S."""
+import torch
+
+NS_COEFFS = (3.4445, -4.7750, 2.0315)
+
+
+def frob(t):
+    """Per-seed Frobenius norm: (S, ...) -> (S,)."""
+    return t.flatten(1).norm(dim=1)
+
+
+def bview(x, like):
+    """Reshape a per-seed vector (S,) so it broadcasts against `like` (S, m, n)."""
+    return x.view(-1, *([1] * (like.dim() - 1)))
+
+
+def total_frob(tensors):
+    """Per-seed Frobenius norm of the concatenation of all layers."""
+    return torch.stack([frob(t) ** 2 for t in tensors]).sum(0).sqrt()
+
+
+def newton_schulz5(g, steps=5, eps=1e-7):
+    """Quintic Newton-Schulz orthogonalization, identical to the atlas_opt optimizers
+    (Frobenius pre-normalization with clamp, transpose when tall)."""
+    a, b, c = NS_COEFFS
+    x = g / bview(frob(g).clamp(min=eps), g)
+    transpose = g.size(-2) > g.size(-1)
+    if transpose:
+        x = x.transpose(-2, -1)
+    for _ in range(steps):
+        A = x @ x.transpose(-2, -1)
+        B = b * A + c * (A @ A)
+        x = a * x + B @ x
+    if transpose:
+        x = x.transpose(-2, -1)
+    return x
+
+
+def polar_svd(g):
+    """Exact polar factor U V^T (all non-zero singular values set to 1)."""
+    u, _, vh = torch.linalg.svd(g, full_matrices=False)
+    return u @ vh
+
+
+def orthogonalize(g, method="ns5", steps=5):
+    if method == "ns5":
+        return newton_schulz5(g, steps=steps)
+    if method == "svd":
+        return polar_svd(g)
+    raise ValueError(f"Unknown orthogonalization method: {method}")
+
+
+def spectral_norm(t):
+    return torch.linalg.matrix_norm(t, ord=2)
+
+
+def frob_inner(x, y):
+    """Per-seed Frobenius inner product <x, y>_F: (S, ...) -> (S,)."""
+    return (x * y).flatten(1).sum(1)
+
+
+def frobenius_reject(a, x):
+    """P_a^perp(x) = x - <x, a>_F / ||a||_F^2 * a: x with its a-component removed, under the
+    Frobenius inner product. Returns x unchanged (up to eps) wherever a is (numerically) zero,
+    since both the inner product and ||a||_F^2 vanish together."""
+    coeff = frob_inner(x, a) / (frob(a) ** 2 + 1e-30)
+    return x - bview(coeff, x) * a
+
+
+def total_cosine(a_list, b_list, eps=1e-12):
+    """Per-seed cosine similarity between two multi-layer directions, treating all layers as
+    one concatenated vector (matching the "global" Frobenius convention): sum_l <a_l,b_l>_F
+    over the product of the two combined norms. NaN wherever either side is (numerically) zero
+    (undefined direction), not 0 -- a zero vector has no angle, so it must not silently read as
+    "orthogonal"."""
+    inner = torch.stack([frob_inner(a, b) for a, b in zip(a_list, b_list)]).sum(0)
+    denom = total_frob(a_list) * total_frob(b_list)
+    cos = inner / denom.clamp(min=eps)
+    return torch.where(denom > eps, cos, torch.full_like(cos, float("nan")))
+
+
+def project_spectral_ball(w, radius):
+    """Euclidean projection onto {W : ||W||_2 <= radius}: clip singular values."""
+    u, s, vh = torch.linalg.svd(w, full_matrices=False)
+    return (u * s.clamp(max=radius).unsqueeze(-2)) @ vh
+
+
+def effective_rank(m, eps=1e-12):
+    """Entropy effective rank of Roy & Vetterli (2007), per seed."""
+    s = torch.linalg.svdvals(m)
+    p = s / s.sum(-1, keepdim=True).clamp(min=eps)
+    entropy = -(p * torch.log(p.clamp(min=eps))).sum(-1)
+    return torch.exp(entropy)
